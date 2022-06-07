@@ -8,6 +8,7 @@
 #include <linux/in.h>
 
 #include "common_struct.h"
+#include "hash_cookie.h"
 
 #define MAX_CSUM_BYTES 64
 
@@ -20,24 +21,39 @@ struct NetPacket{
 };
 
 
-struct bpf_map_def SEC("maps") data_cookis_map = {
-    .type = BPF_MAP_TYPE_HASH,            //BPF_MAP_TYPE_ARRAY,
-    .key_size = sizeof(int),
+struct bpf_map_def SEC("maps") white_table_map = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(__u32),
     .value_size = sizeof(struct DataCookie),
+    .max_entries = 1024,
+};
+
+
+struct bpf_map_def SEC("maps") hash_table_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(struct HashTable),
     .max_entries = 1024,
 };
 
 
 __u32 cookie_counter() {
     return bpf_ktime_get_ns() >> (10 + 10 + 10 + 3); /* 8.6 sec */
-}
+} 
 
 
-void write_hash_table(struct DataCookie *data){
+/*void write_data_table(struct DataCookie *data){
+    __u32 key = data->saddr; 
+
+    bpf_map_update_elem(&data_cookis_map, &key, data, BPF_EXIST);
+}*/
+
+
+void write_hash_table(struct HashTable *data){
     __u32 key = data->saddr;
 
-    bpf_map_update_elem(&data_cookis_map, &key, data, BPF_NOEXIST);
-    bpf_printk("Uspeshno dobavili %x\n     key: %d", data->saddr, key);
+    bpf_map_update_elem(&hash_table_map, &key, data, BPF_ANY);
+    bpf_printk("Uspeshno dobavili %x\n     key: %d", data->cookie, key);
 }
 
 
@@ -80,16 +96,36 @@ int xdp_main(struct xdp_md *ctx) {
     // Проверяем с какого порта пришёл пакет, если с прослушиваемых портов, то просматриваем флаги
     if ((bpf_ntohs(Npack.tcp->dest) == 80) || (bpf_ntohs(Npack.tcp->dest) == 443)) {
         if(Npack.tcp->syn) {    
-            struct DataCookie data_write;
-            data_write.saddr = Npack.ipv4->saddr;
-            data_write.daddr = Npack.ipv4->daddr;
-            data_write.sport = Npack.tcp->source;
-            data_write.dport = Npack.tcp->dest;
-            data_write.seqnum = bpf_ntohl(Npack.tcp->seq) - 1;
-            data_write.time = cookie_counter();
+            __u32 hash = hash_tcp_ip(Npack.ipv4->saddr, Npack.ipv4->daddr, Npack.tcp->source, Npack.tcp->dest, bpf_ntohl(Npack.tcp->seq) - 1);
+            __u32 cookie = hash_cookie(hash, bpf_ntohl(Npack.tcp->seq) - 1, cookie_counter());
+            
+            struct HashTable data;
+            data.saddr = Npack.ipv4->saddr;
+            data.cookie = cookie;
+            
+            write_hash_table(&data);
 
-            write_hash_table(&data_write);
-            return XDP_DROP;
+            // Приступаем к формированию SYN-ACK, который пошлём обратно
+            Npack.tcp->ack_seq = bpf_htonl(bpf_ntohl(Npack.tcp->seq) + 1);
+            Npack.tcp->seq = bpf_htonl(cookie);
+            Npack.tcp->ack = 1;
+            
+            // Меняем местами порт источника и порт назначения
+            __u16 temp_sport = Npack.tcp->source;
+            Npack.tcp->source = Npack.tcp->dest;
+            Npack.tcp->dest = temp_sport;
+            
+            // Меняем местами IP адрес источника и адрес назначения
+            __u32 temp_saddr = Npack.ipv4->saddr;
+            Npack.ipv4->saddr = Npack.ipv4->daddr;
+            Npack.ipv4->daddr = temp_saddr;
+
+            // Изменяем направление Ethernet пакета
+            struct ethhdr temp_eth = *Npack.eth;
+            memcpy(Npack.eth->h_dest, temp_eth.h_source, ETH_ALEN);
+            memcpy(Npack.eth->h_source, temp_eth.h_dest, ETH_ALEN);ы
+            
+            return XDP_TX;
         }
         else if(Npack.tcp->ack) {
             return XDP_PASS;

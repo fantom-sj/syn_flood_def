@@ -6,6 +6,7 @@
 #include <linux/if_link.h>
 
 #include <errno.h>
+#include <malloc.h>
 
 #include "../common/common_params.h"
 #include "func_load_xdp.h"
@@ -20,32 +21,33 @@ int find_map_fd(struct bpf_object *bpf_obj, const char *mapname) {
 	map = bpf_object__find_map_by_name(bpf_obj, mapname);
         if (!map) {
 		fprintf(stderr, "ОШИБКА: не удается найти карту данных: %s\n", mapname);
-		goto out;
+		return map_fd;
 	}
 
 	map_fd = bpf_map__fd(map);
- out:
+	printf("Успешно: Карта с md_map(%d) найдена!\n", map_fd);
 	return map_fd;
 }
 
 
 static void Read_map(int map_fd) {
-	__u32 def_key = 0;
-	
+	__u32 key = 0, next_key = 0;
 
 	while (true) {
 		struct DataCookie value;
-		int err = 1;
-		__u32 *key;
-		err = bpf_map_get_next_key(map_fd, &def_key, key);
-		def_key = *key;
 		
-		err = bpf_map_lookup_and_delete_elem(map_fd, key, &value);
-		bpf_map_delete_elem(map_fd, key);
-		printf("saddr: %x, seqnum: %d, time: %x\n", 
-					value.saddr, value.seqnum, value.time);
+		bpf_map_get_next_key(map_fd, &key, &next_key);
 		
-		usleep(50000);
+		if(errno != ENOENT){
+			bpf_map_lookup_and_delete_elem(map_fd, &key, &value);
+
+			printf("key: %x, daddr: %x, seqnum: %d, time: %x\n", 
+					key, value.saddr, value.seqnum, value.time);
+		}
+
+		key = next_key;
+		
+		//usleep(50000);
 	}
 }
 
@@ -77,12 +79,12 @@ int main(int argc, char **argv) {
 		return EXIT_FAIL_BPF;
 	}
 
-	int stats_map_fd = find_map_fd(bpf_obj, "data_cookis_map");
-	if (stats_map_fd < 0) {
+	int map_fd = find_map_fd(bpf_obj, "data_cookis_map");
+	if (map_fd < 0) {
 		xdp_link_detach(cfg.ifindex, cfg.xdp_flags);
 		return EXIT_FAIL_BPF;
 	}
 
-	Read_map(stats_map_fd);
+	Read_map(map_fd);
 	return EXIT_OK;
 }
